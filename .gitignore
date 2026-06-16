@@ -1,0 +1,10 @@
+# Claude Code 로컬 설정
+.claude/
+
+# 내부 문서/원본 데이터 (배포에 불필요)
+*.docx
+*.xlsx
+*.jpg
+
+# 로컬 개발용 스크립트
+take_screenshots.py

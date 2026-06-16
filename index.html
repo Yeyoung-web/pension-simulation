@@ -1,0 +1,1042 @@
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IRP 연금수령 몬테카를로 시뮬레이션 — 한국투자증권</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
+<script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Pretendard','Noto Sans KR',-apple-system,sans-serif}::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:#ccc;border-radius:3px}</style>
+</head><body><div id="root"></div>
+<script type="text/babel">
+const{useState,useMemo,useCallback,useEffect,useRef}=React;
+const{Line,Area,BarChart,Bar,Cell,XAxis,YAxis,CartesianGrid,Tooltip,Legend,ResponsiveContainer,ReferenceLine,ComposedChart}=Recharts;
+
+// ═══ CI Colors ═══
+const C = {
+  brown: "#5A2800", brownL: "#7A4A1A", brownXL: "#A0724A",
+  blue: "#557DB9", blueM: "#73A5CD", blueL: "#A5C8E1", blueXL: "#C8E1F0", blueXXL: "#E8F1F8",
+  gray: "#999", grayL: "#B3B3B3", grayXL: "#E5E5E5", grayXXL: "#F5F5F3",
+  bg: "#FAFAF8", card: "#FFFFFF", text: "#2D2016", textM: "#5A4A3A", textL: "#8A7A6A",
+  red: "#C44A30", green: "#2A8A5A", amber: "#C4882A",
+};
+
+// ═══ Constants ═══
+const PROFILES = {
+  "원리금보장": { eq: 0, bd: 1, ret: 0.0355, vol: 0.01, port: "-" },
+  "안정추구형": { eq: 0.35, bd: 0.65, ret: 0.04, vol: 0.045, port: "35%:65%" },
+  "위험중립형": { eq: 0.45, bd: 0.55, ret: 0.05, vol: 0.07, port: "45%:55%" },
+  "적극투자형": { eq: 0.60, bd: 0.40, ret: 0.06, vol: 0.10, port: "60%:40%" },
+};
+// rho: 국면별 주식-채권 동태 상관계수 (위기 시 contagion → 양의 상관으로 전환)
+const REGIMES = { "호황": { rA: .015, vA: -.01, p: .30, rho: -0.30 }, "보통": { rA: 0, vA: 0, p: .45, rho: -0.20 }, "침체": { rA: -.02, vA: .02, p: .20, rho: -0.05 }, "위기": { rA: -.05, vA: .05, p: .05, rho: +0.40 } };
+// Markov Chain 전환 확률 행렬: 전년도 국면 → 당해연도 국면 (행 합계 = 1)
+// 침체→침체 50%, 위기→위기 40% : 경기 국면의 지속성(Persistence) 반영
+const TRANSITION = {
+  "호황": { "호황": 0.75, "보통": 0.20, "침체": 0.04, "위기": 0.01 },
+  "보통": { "호황": 0.20, "보통": 0.60, "침체": 0.17, "위기": 0.03 },
+  "침체": { "호황": 0.05, "보통": 0.35, "침체": 0.50, "위기": 0.10 },
+  "위기": { "호황": 0.02, "보통": 0.20, "침체": 0.38, "위기": 0.40 },
+};
+// 자산별 CMA 파라미터 (KOSPI / 국고채 장기 실증 기반)
+const ASSETS = {
+  eq: { ret: 0.075, vol: 0.17 },  // 주식: 기대수익률 7.5%, 연변동성 17%
+  bd: { ret: 0.035, vol: 0.045 }, // 채권: 기대수익률 3.5%, 연변동성 4.5%
+};
+const MACROS = {
+  "현행유지": { rA: 0, iA: 0, l: "조정 없음" },
+  "금리인상": { rA: .005, iA: .003, l: "금리 인상기 (+0.5%p)" },
+  "금리인하": { rA: -.005, iA: -.002, l: "금리 인하기 (-0.5%p)" },
+  "스태그플레이션": { rA: .01, iA: .015, l: "스태그플레이션" },
+};
+const WD_TYPES = {
+  "금액확정형": { l: "금액확정형", d: "매년 입력한 금액만큼 정액수령", n: "운용수익 발생 시 수령기간 증가" },
+  "기간확정형": { l: "기간확정형", d: "입력한 기간동안 연금수령", n: "운용수익 발생 시 매년 수령액 증가" },
+  "1만원수령": { l: "1만원 수령", d: "N년간 1만원 수령 후 (N+1)년차 전액 해지", n: "10년 이내 40% / 10~20년 50% 퇴직소득세 절감", needsPeriod: true },
+  "한도만큼수령": { l: "한도만큼 수령", d: "매년 연금수령 한도만큼 수령", n: "잔여 한도년수 자동 셋팅" },
+  "운용손익길게수령": { l: "운용손익 길게수령", d: "퇴직금 원금 원하는 기간 수령 후 운용손익 연 1,500만원 수령", n: "" },
+};
+const NP_OPTS = [{ l: "없음", v: 0 }, { l: "월 100만원", v: 1000000 }, { l: "월 150만원", v: 1500000 }, { l: "월 200만원", v: 2000000 }];
+const LI_OPTS = [{ l: "없음", v: 0 }, { l: "월 200만원", v: 2000000 }, { l: "월 300만원", v: 3000000 }, { l: "월 400만원", v: 4000000 }];
+const N = 10000;
+
+// ═══ Engine ═══
+// Box-Muller 변환: 균일분포 → 표준정규분포 난수 생성
+const gr = () => { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+// Student-t(ν=5) 표준화 난수: T = Z/√(χ²₅/5) × √(3/5) → Var=1, 첨도 6 (정규분포 첨도 0 대비 두꺼운 꼬리)
+// ν=5 선택 이유: 금융 수익률 실증 연구의 표준 (Cont 2001), ν<4는 분산 미정의, ν→∞는 정규분포 수렴
+const grT = () => { const z = gr(); let c = 0; for (let i = 0; i < 5; i++) { const g = gr(); c += g * g; } return z / Math.sqrt(c / 5) * Math.sqrt(3 / 5); };
+
+// Markov Chain Regime Switching: 전년도 국면(prevKey)을 조건으로 당해연도 국면 결정
+// prevKey=null이면 정상분포(stationary distribution)에서 초기 국면 샘플링
+const pR = (prevKey = null) => { const probs = prevKey ? TRANSITION[prevKey] : Object.fromEntries(Object.entries(REGIMES).map(([k,v]) => [k, v.p])); const r = Math.random(); let c = 0; for (const [k, p] of Object.entries(probs)) { c += p; if (r <= c) return [k, REGIMES[k]]; } return ["보통", REGIMES["보통"]]; };
+
+function calcWD(t, a, y, fa, fp, rp, cr, pensionYr) {
+  if (a <= 0) return 0;
+  const adjY = y + ((pensionYr || 1) - 1);
+  const lim = adjY <= 10 ? a / (11 - adjY) * 1.2 : Infinity;
+  if (t === "금액확정형") return Math.min(fa, a);
+  if (t === "기간확정형") { const r = fp - (y - 1); return r <= 0 ? 0 : Math.min(a / r, a); }
+  if (t === "1만원수령") return y === fp + 1 ? a : y <= fp ? Math.min(10000, a) : 0;
+  if (t === "한도만큼수령") return Math.min(lim, a);
+  if (t === "운용손익길게수령") return y <= fp ? Math.min(rp / fp, a) : Math.min(15000000, a);
+  return Math.min(fa, a);
+}
+
+function calcTax(wd, y, age, txR, rp, sc, tf, cR, cS, cTF, ast, pensionYr) {
+  if (wd <= 0) return { tx: 0, rU: 0, sU: 0, gU: 0, tfU: 0 };
+  // ── 인출순서: ① 과세제외 → ② 이연퇴직소득 → ③+④ 세액공제+운용손익 ──
+  const remTF = Math.max(tf - cTF, 0);      // ① 잔여 과세제외
+  const remR = Math.max(rp - cR, 0);         // ② 잔여 퇴직금
+  const remSG = Math.max(sc - cS, 0);        // ③ 잔여 세액공제 (④운용손익은 잔여 전부)
+  const tfP = Math.min(wd, remTF);           // ① 비과세 인출
+  const rP = Math.min(wd - tfP, remR);       // ② 퇴직금 인출
+  const sgP = Math.max(wd - tfP - rP, 0);    // ③+④ 합산 인출 (세액공제+운용손익)
+
+  // ── 연금수령한도 (수령연차 기준) ──
+  const adjY = y + (pensionYr - 1);           // 실제 수령연차 반영
+  const lim = adjY <= 10 ? ast / (11 - adjY) * 1.2 : Infinity;
+  const taxableWd = wd - tfP;                // ①은 비과세이므로 제외
+  const wIn = Math.min(taxableWd, lim);
+
+  // ── 한도 이내/초과 분배 ──
+  const rIn = Math.min(rP, wIn);
+  const sgIn = Math.min(sgP, Math.max(wIn - rP, 0));
+  const rOut = rP - rIn;
+  const sgOut = sgP - sgIn;
+
+  // ── 세율 적용 ──
+  // 퇴직소득세 감면율: 10년↓ 70%, 10~20년 60%, 20년↑ 50% (2026.1.1 시행)
+  const disc = adjY > 20 ? .5 : adjY > 10 ? .6 : .7;
+  const gRate = age >= 80 ? .03 : age >= 70 ? .04 : .05; // 연금소득세율
+  // 한도이내: ② 퇴직소득세×감면율, ③+④ 연금소득세 (1,500만원 초과 시 16.5%)
+  // 한도초과: ② 퇴직소득세 100%, ③+④ 기타소득세 16.5%
+  const inc = rIn * txR * disc + rOut * txR
+    + (sgIn > 15e6 ? sgIn * .15 : sgIn * gRate)
+    + sgOut * .15;
+  return { tx: Math.round(inc * 1.1), rU: rP, sU: sgP, gU: 0, tfU: tfP };
+}
+
+function runOne(cfg) {
+  const { iA, sA, eA, pf, mc, inf, uR, wT, fA, fP, rP, sC, tR, ls, fee,
+    lsTaxInit, taxDeduct, invGain, tf, pensionYr } = cfg;
+  const n = eA - sA + 1;
+  const path = [iA], wds = [0], txs = [0], nets = [0];
+  const cmaTxs = [lsTaxInit];
+  const tfUs = [0], rUs = [0], sgUs = [0]; // 재원별 인출 추적: ①과세제외, ②퇴직금, ③+④운용수익등
+  let a = iA, cR = 0, cS = 0, cTF = 0;
+  let cmaAsset = iA - lsTaxInit;
+  let regimeKey = null; // Markov Chain 상태: 직전 국면 키 (첫 해는 정상분포에서 초기화)
+  const rrPath = [];
+
+  for (let y = 1; y <= n; y++) {
+    let rg;
+    if (uR) { [regimeKey, rg] = pR(regimeKey); } else { rg = { rA: 0, vA: 0, rho: -0.20 }; }
+    let rr;
+    if (pf.eq > 0) {
+      // Cholesky 분해: 국면별 rho로 주식·채권 상관 노이즈 생성
+      const rho = rg.rho; const z1 = grT(), z2 = grT();
+      const eps_eq = z1, eps_bd = rho * z1 + Math.sqrt(1 - rho * rho) * z2;
+      // 주식: 경기국면(rA) + 거시 반영, 채권: 거시만 반영 (rho가 공분산 담당)
+      const μ_eq = ASSETS.eq.ret + rg.rA + mc.rA - inf - mc.iA;
+      const σ_eq = Math.max(.005, ASSETS.eq.vol + rg.vA);
+      const μ_bd = ASSETS.bd.ret + mc.rA - inf - mc.iA;
+      const σ_bd = Math.max(.005, ASSETS.bd.vol + rg.vA * 0.3);
+      rr = pf.eq * (Math.exp((μ_eq - σ_eq * σ_eq / 2) + σ_eq * eps_eq) - 1)
+         + pf.bd * (Math.exp((μ_bd - σ_bd * σ_bd / 2) + σ_bd * eps_bd) - 1);
+    } else {
+      // 원리금보장 · 직접입력: 단일 자산 경로
+      const μ = pf.ret + rg.rA + mc.rA - inf - mc.iA;
+      const σ = Math.max(.005, pf.vol + rg.vA);
+      rr = Math.exp((μ - σ * σ / 2) + σ * grT()) - 1;
+    }
+    rrPath.push(rr);
+    a = a * (1 + rr);
+    a = a * (1 - fee);
+    const ls_y = (ls[y] || 0); a = Math.max(0, a - ls_y);
+    const wd = calcWD(wT, a, y, fA, fP, rP, cR, pensionYr);
+    const t = calcTax(wd, y, sA + y, tR, rP, sC, tf, cR, cS, cTF, a, pensionYr);
+    cR += t.rU; cS += t.sU; cTF += t.tfU;
+    a = Math.max(0, a - wd);
+    path.push(a); wds.push(wd); txs.push(t.tx); nets.push(wd - t.tx);
+    tfUs.push(t.tfU); rUs.push(t.rU); sgUs.push(t.sU);
+
+    // ═══ CMA 경로 (동일 수익률, 다른 과세) ═══
+    const cmaGain = cmaAsset * Math.max(0, rr); // 양수 수익만 과세
+    // 금융소득세: 15.4% 원천징수, 2,000만원 초과분은 종합과세(약 27.5% 추가)
+    let cmaTaxY = 0;
+    if (cmaGain > 0) {
+      if (cmaGain <= 20000000) {
+        cmaTaxY = Math.round(cmaGain * 0.154);
+      } else {
+        cmaTaxY = Math.round(20000000 * 0.154 + (cmaGain - 20000000) * 0.385);
+      }
+    }
+    cmaAsset = cmaAsset + cmaAsset * rr - cmaTaxY;
+    // CMA에서도 동일 금액 인출 (생활비)
+    cmaAsset = Math.max(0, cmaAsset - wd);
+    cmaTxs.push(cmaTaxY);
+  }
+  return { path, wds, txs, nets, cmaTxs, tfUs, rUs, sgUs, rrPath };
+}
+
+function runMC(cfg) { const r = []; for (let i = 0; i < N; i++) r.push(runOne(cfg)); return r; }
+
+function analyze(sims, sA) {
+  const L = sims[0].path.length, cd = [];
+  let dC = 0; const dA = [];
+  let cumTxSum = 0, cumWdSum = 0, cumNtSum = 0, cumCmaTxSum = 0;
+  for (let y = 0; y < L; y++) {
+    const v = sims.map(s => s.path[y]).sort((a, b) => a - b);
+    const w = sims.map(s => s.wds[y]), t = sims.map(s => s.txs[y]), nt = sims.map(s => s.nets[y]);
+    const ct = sims.map(s => s.cmaTxs[y]);
+    const stf = sims.map(s => s.tfUs[y]), sr = sims.map(s => s.rUs[y]), ssg = sims.map(s => s.sgUs[y]);
+    const n = v.length, avg = a => Math.round(a.reduce((s, x) => s + x, 0) / n);
+    const txAvg = avg(t), wdAvg = avg(w), ntAvg = avg(nt), cmaTxAvg = avg(ct);
+    const tfAvg = avg(stf), rAvg = avg(sr), sgAvg = avg(ssg);
+    cumTxSum += txAvg; cumWdSum += wdAvg; cumNtSum += ntAvg; cumCmaTxSum += cmaTxAvg;
+    cd.push({ age: sA + y - 1,
+      p5: Math.round(v[Math.floor(n * .05)]), p25: Math.round(v[Math.floor(n * .25)]),
+      p50: Math.round(v[Math.floor(n * .5)]), p75: Math.round(v[Math.floor(n * .75)]),
+      p95: Math.round(v[Math.floor(n * .95)]), mean: avg(v),
+      wdM: wdAvg, txM: txAvg, ntM: ntAvg, cmaTxM: cmaTxAvg,
+      tfM: tfAvg, rM: rAvg, sgM: sgAvg, // 재원별 평균: ①과세제외, ②퇴직금, ③+④
+      txRate: wdAvg > 0 ? txAvg / wdAvg : 0, // 실효세율
+      cumTx: cumTxSum, cumWd: cumWdSum, cumNt: cumNtSum, cumCmaTx: cumCmaTxSum,
+      r5_95: [Math.round(v[Math.floor(n * .05)]), Math.round(v[Math.floor(n * .95)])],
+      r25_75: [Math.round(v[Math.floor(n * .25)]), Math.round(v[Math.floor(n * .75)])],
+    });
+  }
+  for (const s of sims) { const i = s.path.findIndex((x, j) => j > 0 && x <= 0); if (i > 0) { dC++; dA.push(sA + i - 1); } }
+  const sr = ((N - dC) / N * 100).toFixed(1);
+  const dd = {}; for (const a of dA) { const b = Math.floor(a / 5) * 5; dd[b] = (dd[b] || 0) + 1; }
+  const ddd = Object.entries(dd).map(([a, c]) => ({ age: `${a}~${+a + 4}세`, count: c, pct: (c / N * 100).toFixed(1) })).sort((a, b) => parseInt(a.age) - parseInt(b.age));
+  const md = dA.length > 0 ? dA.sort((a, b) => a - b)[Math.floor(dA.length / 2)] : null;
+  return { cd, sr, dC, ddd, md, totalTax: cumTxSum, totalWd: cumWdSum, totalNet: cumNtSum, totalCmaTx: cumCmaTxSum };
+}
+
+// ═══ Sequence of Returns Risk ═══
+const SORR_COLORS = ["#C44A30", "#E07820", "#C4882A", "#73A5CD", "#2A8A5A"];
+const SORR_LABELS = ["초반 최하 20%", "하위 20%", "중간 20%", "상위 20%", "초반 최상 20%"];
+
+function analyzeSoRR(sims, sA, earlyYears = 3) {
+  const n = sims.length;
+  const tagged = sims.map(s => {
+    let cum = 1;
+    for (let y = 0; y < Math.min(earlyYears, s.rrPath.length); y++) cum *= (1 + s.rrPath[y]);
+    const depleted = s.path.findIndex((x, j) => j > 0 && x <= 0) > 0;
+    return { s, earlyRet: cum - 1, depleted };
+  }).sort((a, b) => a.earlyRet - b.earlyRet);
+
+  const qSize = Math.floor(n / 5);
+  const quintiles = Array.from({ length: 5 }, (_, q) => {
+    const slice = tagged.slice(q * qSize, (q + 1) * qSize);
+    const survived = slice.filter(t => !t.depleted).length;
+    const avgEarlyRet = slice.reduce((s, t) => s + t.earlyRet, 0) / slice.length;
+    const sorted = [...slice].sort((a, b) => a.s.path[a.s.path.length - 1] - b.s.path[b.s.path.length - 1]);
+    const medianPath = sorted[Math.floor(sorted.length / 2)].s.path;
+    return { label: SORR_LABELS[q], color: SORR_COLORS[q], survivalRate: +(survived / slice.length * 100).toFixed(1), avgEarlyRet, medianPath };
+  });
+
+  const pathLen = quintiles[0].medianPath.length;
+  const pathData = Array.from({ length: pathLen }, (_, i) => {
+    const obj = { age: sA + i - 1 };
+    quintiles.forEach((q, qi) => { obj[`q${qi + 1}`] = Math.round(q.medianPath[i]); });
+    return obj;
+  });
+  return { quintiles, pathData, earlyYears };
+}
+
+// ═══ Format ═══
+const fK = v => {
+  if (v == null) return "-";
+  const a = Math.abs(v);
+  if (a >= 1e8) return `${(v / 1e8).toFixed(1)}억원`;
+  if (a >= 1e4) return `${Math.round(v / 1e4).toLocaleString()}만원`;
+  return `${v.toLocaleString()}원`;
+};
+const fW = v => v == null ? "-" : v.toLocaleString(); // 단위 없이 쉼표만
+const fP = v => `${(v * 100).toFixed(1)}%`;
+
+// ═══ Styles ═══
+const iS = { width: "100%", padding: "8px 10px", borderRadius: 6, border: `1px solid ${C.grayXL}`, background: "#fff", color: C.text, fontSize: 13, outline: "none", boxSizing: "border-box" };
+const selS = { ...iS, cursor: "pointer" };
+const cardS = { background: C.card, border: `1px solid ${C.grayXL}`, borderRadius: 12, padding: "18px 20px", marginBottom: 14, boxShadow: "0 1px 4px rgba(0,0,0,0.04)" };
+
+const Sec = ({ t, ch }) => (<div style={cardS}><h3 style={{ fontSize: 13, fontWeight: 700, color: C.brown, margin: "0 0 14px", borderBottom: `2px solid ${C.blueL}`, paddingBottom: 8 }}>{t}</h3>{ch}</div>);
+const Inp = ({ l, sub, ch }) => (<div style={{ marginBottom: 10 }}><label style={{ display: "block", fontSize: 11, color: C.textM, marginBottom: 2, fontWeight: 500 }}>{l}</label>{ch}{sub && <div style={{ fontSize: 9, color: C.textL, marginTop: 1 }}>{sub}</div>}</div>);
+const Row2 = ({ children }) => (<div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>{children}</div>);
+const Badge = ({ t, c }) => (<span style={{ padding: "3px 8px", borderRadius: 4, background: c || C.blueXXL, color: C.brown, fontSize: 10, fontWeight: 600 }}>{t}</span>);
+
+const StatCard = ({ l, v, s, accent }) => (<div style={{
+  background: accent ? `linear-gradient(135deg, ${C.blueXXL}, #fff)` : C.card,
+  border: `1px solid ${accent ? C.blueL : C.grayXL}`, borderRadius: 10,
+  padding: "14px 16px", textAlign: "center", flex: "1 1 0", minWidth: 120,
+  boxShadow: accent ? `0 2px 8px ${C.blueL}40` : "0 1px 3px rgba(0,0,0,0.04)",
+}}>
+  <div style={{ fontSize: 10, color: C.textL, marginBottom: 4, fontWeight: 500 }}>{l}</div>
+  <div style={{ fontSize: accent ? 26 : 20, fontWeight: 800, color: accent ? C.blue : C.brown, lineHeight: 1.1 }}>{v}</div>
+  {s && <div style={{ fontSize: 9, color: C.textL, marginTop: 3 }}>{s}</div>}
+</div>);
+
+const CTip = ({ active, payload, label }) => { if (!active || !payload?.length) return null; return (<div style={{ background: "#fff", border: `1px solid ${C.grayXL}`, borderRadius: 8, padding: "10px 14px", fontSize: 11, color: C.text, boxShadow: "0 4px 16px rgba(0,0,0,0.1)" }}><div style={{ fontWeight: 700, marginBottom: 6, color: C.brown }}>{label}세</div>{payload.filter(p => p.value !== undefined && !Array.isArray(p.value)).map((p, i) => (<div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 14, marginBottom: 2 }}><span style={{ color: p.color || C.textL }}>{p.name}</span><span style={{ fontWeight: 600 }}>{fK(p.value)}</span></div>))}</div>); };
+
+const TODAY = (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; })();
+const calcAge = (birth, ref) => { if (!birth || !ref) return 0; const b = new Date(birth), r = new Date(ref); let a = r.getFullYear() - b.getFullYear(); if (r.getMonth() < b.getMonth() || (r.getMonth() === b.getMonth() && r.getDate() < b.getDate())) a--; return a; };
+
+// ═══ Alert Banner ═══
+const Alert = ({ type, msg, action, onAction }) => (
+  <div style={{ background: type === "warn" ? "#FFF8E1" : type === "info" ? C.blueXXL : "#FFF5F5",
+    border: `1px solid ${type === "warn" ? "#F59E0B" : type === "info" ? C.blueL : C.red}30`,
+    borderRadius: 8, padding: "10px 14px", marginBottom: 8, display: "flex", alignItems: "center", gap: 10, fontSize: 11 }}>
+    <span style={{ fontSize: 16 }}>{type === "warn" ? "⚠️" : type === "info" ? "ℹ️" : "💡"}</span>
+    <span style={{ flex: 1, color: C.textM }}>{msg}</span>
+    {action && <button onClick={onAction} style={{ padding: "4px 10px", borderRadius: 5, border: `1px solid ${C.blue}`, background: C.blueXXL, color: C.blue, fontSize: 10, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>{action}</button>}
+  </div>
+);
+
+// ═══ Main App ═══
+function App() {
+  const [inp, setInp] = useState({
+    name: "이한투", birthDate: "1965-01-01", hireDate: "1997-01-01",
+    retireDate: "2025-12-31", schemeDate: "2015-01-01",
+    evalDate: TODAY, pensionStartDate: TODAY,
+    irpOpenDate: "2020-01-01",
+    currentAge: 61, retireAge: 60, startAge: 61, targetAge: 85,
+    taxFreeContrib: 0, retPrincipal: 500000000,
+    taxDeductContrib: 0, investGain: 0, totalAsset: 500000000,
+    taxCalcMode: "자동 계산", retTax: 33549990, localTax: 3354990,
+    retTaxRate: 0.06710,
+    wdType: "금액확정형", fixedAmount: 24000000, fixedPeriod: 10,
+    pensionYear: 1,
+    riskProfile: "위험중립형", customReturn: 0.03,
+    macroScenario: "현행유지", inflation: 0.02, useRegime: true,
+    npOption: "월 150만원", liOption: "월 300만원",
+    onlineIRP: true, vestingPeriod: 1, feeRate: 0,
+    lumpSums: {},
+  });
+  const [lsAge, setLsAge] = useState(""); const [lsAmt, setLsAmt] = useState("");
+  const [res, setRes] = useState(null);
+  const [sorr, setSorr] = useState(null);
+  const [running, setRunning] = useState(false);
+  const [tab, setTab] = useState("tax");
+  const autoRun = useRef(false);
+  const u = (k, v) => setInp(p => ({ ...p, [k]: v }));
+
+  // ── 날짜 기반 자동 산출 ──
+  useEffect(() => {
+    const age = calcAge(inp.birthDate, inp.pensionStartDate);
+    const retAge = calcAge(inp.birthDate, inp.retireDate);
+    // 2013.3.1 이전 가입 → 연금수령연차 6부터 기산 (소득세법 시행령 §40조의2)
+    const pre2013 = inp.schemeDate < "2013-03-01";
+    const baseYear = pre2013 ? 6 : 1;
+    if (age > 0) setInp(p => ({ ...p, startAge: age, currentAge: age, retireAge: retAge, pensionYear: baseYear }));
+  }, [inp.birthDate, inp.pensionStartDate, inp.retireDate, inp.schemeDate]);
+
+  // ── 입력 검증 메시지 ──
+  const warnings = useMemo(() => {
+    const w = [];
+    // 연금개시일 >= 퇴직일
+    if (inp.pensionStartDate < inp.retireDate) w.push({ t: "warn", m: "연금개시일이 퇴직일보다 빠릅니다. 퇴직일 이후로 설정해 주세요." });
+    // 연금개시연령 >= 55세
+    if (inp.startAge < 55) w.push({ t: "warn", m: `연금개시연령이 ${inp.startAge}세입니다. 최소 55세 이상이어야 합니다.` });
+    // 목표연령 > 개시연령
+    if (inp.targetAge <= inp.startAge) w.push({ t: "warn", m: "목표 연령이 개시 연령보다 같거나 작습니다." });
+    // 재원 합계 검증
+    const sum = inp.taxFreeContrib + inp.retPrincipal + inp.taxDeductContrib + inp.investGain;
+    if (sum > 0 && sum !== inp.totalAsset) w.push({ t: "warn", m: `재원 합계(${fK(sum)})와 총 평가금액(${fK(inp.totalAsset)})이 일치하지 않습니다.` });
+    // 퇴직소득세율 범위
+    if (inp.retTaxRate > 0.2) w.push({ t: "warn", m: `퇴직소득세율이 ${fP(inp.retTaxRate)}로 비정상적으로 높습니다.` });
+    // 5년 가입 요건 (소득세법 시행령 §40조의2③)
+    // 퇴직금(이연퇴직소득)이 있으면 5년 요건 면제
+    if (inp.retPrincipal === 0) {
+      const irpD = new Date(inp.irpOpenDate);
+      const startD = new Date(inp.pensionStartDate);
+      const diffYears = (startD - irpD) / (365.25 * 24 * 60 * 60 * 1000);
+      if (diffYears < 5) {
+        w.push({ t: "warn", m: `퇴직금 없이 자기부담금만 있는 경우, IRP 개설일(${inp.irpOpenDate})로부터 5년 경과 후 연금수령 가능합니다. 현재 ${diffYears.toFixed(1)}년 경과.` });
+      }
+    }
+    // 2013.3.1 이전 가입 안내
+    if (inp.schemeDate < "2013-03-01") {
+      w.push({ t: "info", m: `2013.3.1 이전 가입 계좌 → 연금수령연차 ${inp.pensionYear}부터 기산 (한도 계산 시 유리)` });
+    }
+    return w;
+  }, [inp]);
+
+  // ── 절세 최적화 알림 (시뮬레이션 결과 기반) ──
+  const taxAlerts = useMemo(() => {
+    const a = [];
+    if (!res) return a;
+
+    // 1. ③+④에서 연 1,500만원 초과 인출 감지 (결과 테이블에서)
+    const overYears = res.cd.filter(r => r.sgM > 15000000);
+    if (overYears.length > 0) {
+      const firstAge = overYears[0].age;
+      const retYears = Math.max(1, firstAge - inp.startAge);
+      a.push({ t: "tip",
+        m: `${firstAge}세부터 ③+④ 운용수익에서 연 1,500만원 초과 인출 → 세율 16.5% 적용 중 (${overYears.length}년간). '운용손익 길게수령'으로 전환하면 ${retYears}년간 퇴직금 원금 수령 후 이후 연 1,500만원씩 저율 과세됩니다.`,
+        action: "운용손익 길게수령 전환",
+        handler: () => { u("wdType", "운용손익길게수령"); u("fixedPeriod", retYears); autoRun.current = true; } });
+    }
+
+    // 2. 수령 기간별 퇴직소득세 감면 안내
+    if (inp.wdType === "금액확정형" && inp.fixedAmount > 0) {
+      const years = Math.ceil(inp.totalAsset / inp.fixedAmount);
+      if (years < 10) {
+        a.push({ t: "tip",
+          m: `현재 설정 시 약 ${years}년 내 소진 예상입니다. 10년↑ 30% 감면, 20년↑ 50% 감면됩니다.`,
+          action: "10년 분할 설정",
+          handler: () => { u("fixedAmount", Math.round(inp.totalAsset / 10)); autoRun.current = true; } });
+      } else if (years >= 10 && years < 20) {
+        a.push({ t: "tip",
+          m: `현재 약 ${years}년 수령 예상(퇴직소득세 30% 감면). 20년↑ 50% 감면됩니다.`,
+          action: "20년 분할 설정",
+          handler: () => { u("fixedAmount", Math.round(inp.totalAsset / 20)); autoRun.current = true; } });
+      } else if (years >= 20) {
+        a.push({ t: "tip",
+          m: `현재 약 ${years}년 수령 예상(퇴직소득세 50% 최대 감면 적용 중).` });
+      }
+    }
+    if (inp.wdType === "기간확정형") {
+      if (inp.fixedPeriod < 10) {
+        a.push({ t: "tip", m: `${inp.fixedPeriod}년 수령 시 퇴직소득세 30% 감면. 20년↑ 50% 감면됩니다.`,
+          action: "20년으로 변경", handler: () => { u("fixedPeriod", 20); autoRun.current = true; } });
+      } else if (inp.fixedPeriod < 20) {
+        a.push({ t: "tip", m: `${inp.fixedPeriod}년 수령 시 퇴직소득세 30% 감면. 20년↑ 50% 감면됩니다.`,
+          action: "20년으로 변경", handler: () => { u("fixedPeriod", 20); autoRun.current = true; } });
+      }
+    }
+    return a;
+  }, [res, inp.wdType, inp.fixedAmount, inp.fixedPeriod, inp.totalAsset]);
+
+  const pf = inp.riskProfile === "직접입력" ? { eq: 0, bd: 1, ret: inp.customReturn, vol: 0.03, port: "수기" } : PROFILES[inp.riskProfile];
+  const mc = MACROS[inp.macroScenario];
+  const eR = useMemo(() => {
+    let baseRet, baseVol;
+    if (pf.eq > 0) {
+      baseRet = pf.eq * ASSETS.eq.ret + pf.bd * ASSETS.bd.ret;
+      const rhoN = REGIMES["보통"].rho; // 보통 국면 기준 상관계수
+      baseVol = Math.sqrt(pf.eq * pf.eq * ASSETS.eq.vol * ASSETS.eq.vol + pf.bd * pf.bd * ASSETS.bd.vol * ASSETS.bd.vol + 2 * pf.eq * pf.bd * rhoN * ASSETS.eq.vol * ASSETS.bd.vol);
+    } else { baseRet = pf.ret; baseVol = pf.vol; }
+    const nom = baseRet + mc.rA;
+    return { nom, real: nom - inp.inflation - mc.iA, vol: baseVol };
+  }, [inp.riskProfile, inp.customReturn, inp.macroScenario, inp.inflation]);
+  const npVal = NP_OPTS.find(o => o.l === inp.npOption)?.v || 0;
+  const liVal = LI_OPTS.find(o => o.l === inp.liOption)?.v || 0;
+
+  const addLS = () => {
+    const a = parseInt(lsAge), m = parseInt(lsAmt);
+    if (!a || !m) return;
+    if (a < inp.startAge) { alert(`추가목돈 수령 연령은 연금개시연령(${inp.startAge}세) 이상이어야 합니다.`); return; }
+    if (a < 55) { alert("추가목돈 수령 연령은 55세 이상이어야 합니다."); return; }
+    if (a > inp.targetAge) { alert(`목표 연령(${inp.targetAge}세) 이내로 입력해 주세요.`); return; }
+    const yr = a - inp.startAge + 1;
+    if (yr > 0) { u("lumpSums", { ...inp.lumpSums, [yr]: m }); setLsAge(""); setLsAmt(""); }
+  };
+
+  // ── 일시금 세액 계산 (IRP vs CMA 비교용) ──
+  const lumpSumTax = useMemo(() => {
+    const retTx = Math.round(inp.retPrincipal * inp.retTaxRate);
+    const localTx = Math.round(retTx * 0.1);
+    const gainTx = Math.round((inp.taxDeductContrib + inp.investGain) * 0.165);
+    const total = retTx + localTx + gainTx;
+    return { retTx, localTx, gainTx, total, netAmount: inp.totalAsset - total,
+      effectiveRate: inp.totalAsset > 0 ? total / inp.totalAsset : 0 };
+  }, [inp.retPrincipal, inp.retTaxRate, inp.taxDeductContrib, inp.investGain, inp.totalAsset]);
+
+  const run = useCallback(() => {
+    setRunning(true);
+    setTimeout(() => {
+      const sims = runMC({ iA: inp.totalAsset, sA: inp.startAge, eA: inp.targetAge, pf, mc,
+        inf: inp.inflation, uR: inp.useRegime, wT: inp.wdType, fA: inp.fixedAmount,
+        fP: inp.fixedPeriod, rP: inp.retPrincipal, sC: inp.taxDeductContrib,
+        tR: inp.retTaxRate, ls: inp.lumpSums, fee: inp.feeRate,
+        lsTaxInit: lumpSumTax.total, taxDeduct: inp.taxDeductContrib, invGain: inp.investGain,
+        tf: inp.taxFreeContrib, pensionYr: inp.pensionYear });
+      setRes(analyze(sims, inp.startAge));
+      setSorr(analyzeSoRR(sims, inp.startAge));
+      setRunning(false);
+    }, 30);
+  }, [inp, pf, mc, lumpSumTax]);
+
+  useEffect(() => { run(); }, []);
+  // 알림 버튼 클릭 후 자동 실행
+  useEffect(() => { if (autoRun.current) { autoRun.current = false; run(); } }, [inp.wdType, inp.fixedAmount, inp.fixedPeriod]);
+
+  const tabs = [{ id: "tax", l: "절세 효과" }, { id: "asset", l: "자산 추이" }, { id: "wd", l: "수령액 추이" }, { id: "dep", l: "고갈 분포" }, { id: "sorr", l: "순서 리스크" }, { id: "tbl", l: "상세 테이블" }];
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "'Pretendard','Noto Sans KR',-apple-system,sans-serif" }}>
+      {/* Header */}
+      <div style={{ background: C.brown, padding: "16px 28px", display: "flex", alignItems: "center", gap: 14 }}>
+        <div style={{ maxWidth: 1300, width: "100%", margin: "0 auto", display: "flex", alignItems: "center", gap: 14 }}>
+          <img src="/mnt/user-data/uploads/한국투자증권_국문CI.png" alt="CI" style={{ height: 24, filter: "brightness(10)" }}
+            onError={e => { e.target.style.display = "none"; }} />
+          <div style={{ height: 20, width: 1, background: "rgba(255,255,255,0.3)" }} />
+          <div>
+            <h1 style={{ fontSize: 16, fontWeight: 700, margin: 0, color: "#fff", letterSpacing: "-0.3px" }}>IRP 연금수령 몬테카를로 시뮬레이션</h1>
+            <p style={{ fontSize: 9, color: "#fff", margin: 0, opacity: 0.85 }}>{N.toLocaleString()}회 반복 · 6종 수령옵션 · 동적 시장국면 · 정밀 세금 계산</p>
+          </div>
+          <div style={{ marginLeft: "auto", fontSize: 10, color: "#fff", opacity: 0.85 }}>한국투자증권 연금혁신본부</div>
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 1300, margin: "0 auto", padding: "18px 16px", display: "grid", gridTemplateColumns: "320px 1fr", gap: 16 }}>
+        {/* ══ LEFT PANEL ══ */}
+        <div style={{ display: "flex", flexDirection: "column", maxHeight: "calc(100vh - 90px)" }}>
+        <div style={{ flex: 1, overflowY: "auto", paddingRight: 4, paddingBottom: 12 }}>
+
+          {/* 고객정보 */}
+          <Sec t="□ 고객 성명 / 기초정보" ch={<>
+            <Inp l="고객 성명" ch={<input style={iS} value={inp.name} onChange={e => u("name", e.target.value)} />} />
+            <Row2>
+              <Inp l="생년월일" ch={<input style={iS} type="date" value={inp.birthDate} onChange={e => u("birthDate", e.target.value)} />} />
+              <Inp l="평가기준일" ch={<input style={iS} type="date" value={inp.evalDate} onChange={e => u("evalDate", e.target.value)} />} />
+            </Row2>
+            <Row2>
+              <Inp l="입사일(기산일)" ch={<input style={iS} type="date" max={inp.retireDate} value={inp.hireDate} onChange={e => u("hireDate", e.target.value)} />} />
+              <Inp l="퇴직일" ch={<input style={iS} type="date" min={inp.hireDate} value={inp.retireDate} onChange={e => u("retireDate", e.target.value)} />} />
+            </Row2>
+            <Row2>
+              <Inp l="퇴직연금제도 가입일" sub="2013.3.1 기준 연차 기산" ch={<input style={iS} type="date" max={inp.retireDate} value={inp.schemeDate} onChange={e => u("schemeDate", e.target.value)} />} />
+              <Inp l="IRP 계좌 개설일" sub="5년 가입요건 기산일" ch={<input style={iS} type="date" value={inp.irpOpenDate} onChange={e => u("irpOpenDate", e.target.value)} />} />
+            </Row2>
+            <Inp l="연금개시일" sub={inp.pensionStartDate < inp.retireDate ? "⚠ 퇴직일 이후여야 합니다" : ""} ch={<input style={{ ...iS, borderColor: inp.pensionStartDate < inp.retireDate ? C.red : undefined }} type="date" min={inp.retireDate} value={inp.pensionStartDate} onChange={e => u("pensionStartDate", e.target.value)} />} />
+            <Row2>
+              <Inp l="현재(개시) 연령" sub={`생년월일 + 연금개시일 기준 자동 산출 (만 ${inp.startAge}세)`} ch={<input style={{ ...iS, background: "#f0f0ee" }} type="number" value={inp.startAge} readOnly />} />
+              <Inp l="연금수령 종료 연령 (세)" sub={inp.targetAge <= inp.startAge ? "⚠ 개시연령보다 커야 합니다" : `${inp.startAge}세부터 ${inp.targetAge}세까지 ${inp.targetAge - inp.startAge}년간 시뮬레이션`} ch={<input style={{ ...iS, borderColor: inp.targetAge <= inp.startAge ? C.red : undefined }} type="number" min={inp.startAge + 1} max={120} value={inp.targetAge} onChange={e => u("targetAge", +e.target.value)} />} />
+            </Row2>
+          </>} />
+
+          {/* 연금소득 재원 */}
+          <Sec t="□ 연금소득 재원" ch={<>
+            <Inp l="합계 (총 평가금액, 원)" ch={<><input style={iS} type="number" value={inp.totalAsset} onChange={e => u("totalAsset", +e.target.value)} /><div style={{ fontSize: 11, color: C.blue, marginTop: 2, fontWeight: 600 }}>{fW(inp.totalAsset)}원 ({fK(inp.totalAsset)})</div></>} />
+            <Row2>
+              <Inp l="① 과세제외 자기부담금 (원)" sub="세액공제 미적용분(비과세)" ch={<input style={iS} type="number" value={inp.taxFreeContrib} onChange={e => u("taxFreeContrib", +e.target.value)} />} />
+              <Inp l="② IRP 입금 퇴직금 (원)" sub="과세이연 퇴직소득" ch={<input style={iS} type="number" value={inp.retPrincipal} onChange={e => u("retPrincipal", +e.target.value)} />} />
+            </Row2>
+            <Row2>
+              <Inp l="③ 세액공제 자기부담금 (원)" ch={<input style={iS} type="number" value={inp.taxDeductContrib} onChange={e => u("taxDeductContrib", +e.target.value)} />} />
+              <Inp l="④ 운용손익 (원)" ch={<input style={iS} type="number" value={inp.investGain} onChange={e => u("investGain", +e.target.value)} />} />
+            </Row2>
+            <div style={{ background: C.blueXXL, borderRadius: 6, padding: "8px 10px", fontSize: 10, color: C.textM, marginTop: 4 }}>
+              ①+②+③+④ = {fK(inp.taxFreeContrib + inp.retPrincipal + inp.taxDeductContrib + inp.investGain)}
+              {(inp.taxFreeContrib + inp.retPrincipal + inp.taxDeductContrib + inp.investGain) !== inp.totalAsset &&
+                <span style={{ color: C.red, fontWeight: 700, marginLeft: 6 }}>≠ 합계 {fK(inp.totalAsset)}</span>}
+            </div>
+          </>} />
+
+          {/* 퇴직소득세 */}
+          <Sec t="□ 퇴직소득세" ch={<>
+            <Row2>
+              <Inp l="퇴직소득세 입력방식" ch={<select style={selS} value={inp.taxCalcMode} onChange={e => u("taxCalcMode", e.target.value)}>
+                <option>자동 계산</option><option>직접 입력</option>
+              </select>} />
+              <Inp l="이연 퇴직소득세 (원)" ch={<><input style={iS} type="number" value={inp.retTax} onChange={e => u("retTax", +e.target.value)} disabled={inp.taxCalcMode === "자동 계산"} /><div style={{ fontSize: 9, color: C.textL, marginTop: 1 }}>{fW(inp.retTax)}원</div></>} />
+            </Row2>
+            <Row2>
+              <Inp l="지방소득세 (10% 자동, 원)" ch={<><input style={iS} type="number" value={inp.localTax} readOnly /><div style={{ fontSize: 9, color: C.textL, marginTop: 1 }}>{fW(inp.localTax)}원</div></>} />
+              <Inp l="퇴직소득세율 (지방세 제외)" ch={<input style={iS} type="number" step="0.001" value={inp.retTaxRate} onChange={e => u("retTaxRate", +e.target.value)} />} sub={`${fP(inp.retTaxRate)} (지방세 포함 ${fP(inp.retTaxRate * 1.1)})`} />
+            </Row2>
+          </>} />
+
+          {/* 수령 옵션 */}
+          <Sec t="□ 연금수령 옵션" ch={<>
+            <Inp l="연금수령 방식" ch={<select style={selS} value={inp.wdType} onChange={e => u("wdType", e.target.value)}>
+              {Object.entries(WD_TYPES).map(([k, v]) => <option key={k} value={k}>{v.l}</option>)}
+            </select>} />
+            <div style={{ background: C.blueXXL, borderRadius: 6, padding: "8px 10px", fontSize: 10, color: C.textM, lineHeight: 1.6, marginBottom: 10 }}>
+              <div style={{ fontWeight: 700, color: C.brown }}>{WD_TYPES[inp.wdType].l}</div>
+              <div>{WD_TYPES[inp.wdType].d}</div>
+              {WD_TYPES[inp.wdType].n && <div style={{ color: C.blue }}>💡 {WD_TYPES[inp.wdType].n}</div>}
+            </div>
+            {inp.wdType === "금액확정형" && (
+              <Inp l="연간 수령 희망액 (원)" ch={<><input style={iS} type="number" min={0} value={inp.fixedAmount} onChange={e => u("fixedAmount", +e.target.value)} /><div style={{ fontSize: 10, color: C.blue, marginTop: 2 }}>연 {fK(inp.fixedAmount)} (월 {fK(Math.round(inp.fixedAmount / 12))})</div></>} />
+            )}
+            {(inp.wdType === "기간확정형" || inp.wdType === "운용손익길게수령" || inp.wdType === "1만원수령") && (
+              <Inp l={inp.wdType === "기간확정형" ? "수령 기간 (년)" : inp.wdType === "1만원수령" ? "1만원 수령 기간 (년)" : "원금 수령 기간 (년)"} sub={inp.wdType === "1만원수령" ? `${inp.fixedPeriod}년간 1만원 수령 후 ${inp.fixedPeriod + 1}년차에 전액 해지` : undefined} ch={<input style={iS} type="number" min={1} max={inp.targetAge - inp.startAge} value={inp.fixedPeriod} onChange={e => u("fixedPeriod", +e.target.value)} />} />
+            )}
+            <Inp l="연금수령연차 (기산)" sub={inp.schemeDate < "2013-03-01" ? `2013.3.1 이전 가입 → ${inp.pensionYear}부터 기산 (자동)` : `2013.3.1 이후 가입 → 1부터 기산 (자동)`} ch={<input style={{ ...iS, background: "#f0f0ee" }} type="number" min={1} max={30} value={inp.pensionYear} readOnly />} />
+          </>} />
+
+          {/* 추가목돈 */}
+          <Sec t="□ 연금개시 후 추가목돈 수령" ch={<>
+            <Row2>
+              <Inp l="수령 연령" ch={<input style={iS} type="number" min={inp.startAge} max={inp.targetAge} placeholder={`${inp.startAge}~${inp.targetAge}`} value={lsAge} onChange={e => setLsAge(e.target.value)} />} />
+              <Inp l="수령액 (원)" ch={<input style={iS} type="number" placeholder="예: 50,000,000" value={lsAmt} onChange={e => setLsAmt(e.target.value)} />} />
+            </Row2>
+            <button onClick={addLS} style={{ width: "100%", padding: "7px", borderRadius: 6, border: `1px solid ${C.blueL}`, background: C.blueXXL, color: C.blue, fontSize: 11, fontWeight: 600, cursor: "pointer", marginTop: 4 }}>+ 추가</button>
+            {Object.keys(inp.lumpSums).length > 0 && (
+              <div style={{ marginTop: 8, fontSize: 10, color: C.textM }}>
+                {Object.entries(inp.lumpSums).map(([yr, amt]) => (
+                  <div key={yr} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", borderBottom: `1px solid ${C.grayXL}` }}>
+                    <span>{inp.startAge + parseInt(yr)}세</span>
+                    <span style={{ fontWeight: 600 }}>{fK(amt)}</span>
+                    <button onClick={() => { const ls = { ...inp.lumpSums }; delete ls[yr]; u("lumpSums", ls); }}
+                      style={{ background: "none", border: "none", color: C.red, cursor: "pointer", fontSize: 10 }}>삭제</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>} />
+
+          {/* 투자성향 */}
+          <Sec t="□ 투자성향 선택" ch={<>
+            <Inp l="투자 성향" ch={<select style={selS} value={inp.riskProfile} onChange={e => u("riskProfile", e.target.value)}>
+              {Object.keys(PROFILES).map(k => <option key={k}>{k}</option>)}
+              <option value="직접입력">직접 입력</option>
+            </select>} />
+            {inp.riskProfile === "직접입력" && <Inp l="기대수익률 직접 입력" ch={<input style={iS} type="number" step="0.005" value={inp.customReturn} onChange={e => u("customReturn", +e.target.value)} />} />}
+            <div style={{ background: C.blueXXL, borderRadius: 6, padding: "8px 10px", fontSize: 10, color: C.textM, marginBottom: 6 }}>
+              {inp.riskProfile !== "직접입력" && <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}><span>포트폴리오 (주식:채권)</span><span style={{ fontWeight: 700 }}>{pf.port}</span></div>}
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}><span>명목 기대수익률</span><span style={{ fontWeight: 700, color: C.blue }}>{fP(eR.nom)}</span></div>
+              <div style={{ fontSize: 8, color: C.textL, marginBottom: 4 }}>{pf.eq > 0 ? `= 주식${fP(pf.eq)}×${fP(ASSETS.eq.ret)} + 채권${fP(pf.bd)}×${fP(ASSETS.bd.ret)} + 거시(${mc.rA >= 0 ? "+" : ""}${fP(mc.rA)})` : `= CMA(${fP(pf.ret)}) + 거시금리(${mc.rA >= 0 ? "+" : ""}${fP(mc.rA)})`}</div>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}><span>실질수익률 (물가조정)</span><span style={{ fontWeight: 700, color: eR.real >= 0 ? C.green : C.red }}>{fP(eR.real)}</span></div>
+              <div style={{ fontSize: 8, color: C.textL, marginBottom: 4 }}>= 명목({fP(eR.nom)}) − 인플레({fP(inp.inflation)}) − 물가조정({fP(mc.iA)})</div>
+              <div style={{ display: "flex", justifyContent: "space-between" }}><span>연간 변동성(σ)</span><span style={{ fontWeight: 700 }}>{fP(eR.vol)}</span></div>
+            </div>
+            {/* 수익률 산출 근거 주석 */}
+            <div style={{ background: "#FFF9F0", border: `1px solid ${C.brownXL}40`, borderRadius: 6, padding: "8px 10px", fontSize: 9, color: C.textM, lineHeight: 1.7, marginBottom: 10 }}>
+              <div style={{ fontWeight: 700, color: C.brown, marginBottom: 3 }}>📐 수익률 산출 근거</div>
+              {pf.eq > 0 ? (<>
+                <div><b>명목 기대수익률</b> = 주식({fP(pf.eq)})×CMA_eq({fP(ASSETS.eq.ret)}) + 채권({fP(pf.bd)})×CMA_bd({fP(ASSETS.bd.ret)}) + 거시({mc.rA >= 0 ? "+" : ""}{fP(mc.rA)})</div>
+                <div>→ {fP(pf.eq * ASSETS.eq.ret + pf.bd * ASSETS.bd.ret)} {mc.rA >= 0 ? "+" : ""} {fP(mc.rA)} = <b>{fP(eR.nom)}</b></div>
+              </>) : (<>
+                <div><b>명목 기대수익률</b> = CMA 기반 기대수익률({fP(pf.ret)}) + 거시경제 금리 조정({mc.rA >= 0 ? "+" : ""}{fP(mc.rA)})</div>
+                <div>→ {fP(pf.ret)} {mc.rA >= 0 ? "+" : ""} {fP(mc.rA)} = <b>{fP(eR.nom)}</b></div>
+              </>)}
+              <div style={{ marginTop: 3 }}><b>실질수익률</b> = 명목수익률({fP(eR.nom)}) − 기대인플레이션({fP(inp.inflation)}) − 물가 조정({fP(mc.iA)})</div>
+              <div>→ {fP(eR.nom)} − {fP(inp.inflation)} − {fP(mc.iA)} = <b style={{ color: eR.real >= 0 ? C.green : C.red }}>{fP(eR.real)}</b></div>
+              <div style={{ marginTop: 3 }}><b>Itô 보정 후 로그드리프트(μ*)</b> = 실질수익률({fP(eR.real)}) − σ²/2 ({fP(-eR.vol * eR.vol / 2)}) = <b style={{ color: C.blue }}>{fP(eR.real - eR.vol * eR.vol / 2)}</b></div>
+              <div style={{ fontSize: 8, color: C.textL }}>{pf.eq > 0 ? `→ 주식·채권 개별 Itô 보정 후 exp(μ*+σ·ε)−1 가중합 (국면별 ρ: 호황 ${REGIMES["호황"].rho} / 보통 ${REGIMES["보통"].rho} / 침체 ${REGIMES["침체"].rho} / 위기 ${REGIMES["위기"].rho})` : `→ 시뮬레이션 적용식: exp(μ* + σ·ε) − 1, σ²/2 보정 ${fP(eR.vol * eR.vol / 2)}`}</div>
+              <div style={{ marginTop: 3, color: C.textL }}>* CMA: 한국투자신탁운용 장기자본시장가정(Long-Term Capital Market Assumptions)</div>
+            </div>
+            {/* Regime Switching 설명 */}
+            {inp.useRegime && (
+              <div style={{ background: "#F0F5FA", border: `1px solid ${C.blueL}60`, borderRadius: 6, padding: "8px 10px", fontSize: 9, color: C.textM, lineHeight: 1.7, marginBottom: 10 }}>
+                <div style={{ fontWeight: 700, color: C.blue, marginBottom: 3 }}>🔄 Markov-Regime Switching + Student-t 모델</div>
+                <div>전년도 국면에 따라 <b>Markov Chain 전환 확률 행렬</b>로 다음 국면이 결정됩니다 (예: 침체→침체 50%, 위기→위기 40%). 수익률 충격은 정규분포 대신 <b>Student-t(ν=5)</b>를 적용하여 금융위기급 극단 손실을 현실적으로 반영합니다.</div>
+                <div style={{ marginTop: 4, display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 4 }}>
+                  {Object.entries(REGIMES).map(([k, v]) => (
+                    <div key={k} style={{ textAlign: "center", padding: "3px 0", borderRadius: 4, background: k === "호황" ? "#E8F5E9" : k === "보통" ? C.blueXXL : k === "침체" ? "#FFF8E1" : "#FFEBEE" }}>
+                      <div style={{ fontWeight: 700, fontSize: 10 }}>{k}</div>
+                      <div>확률 {(v.p * 100)}%</div>
+                      <div>수익률 {v.rA >= 0 ? "+" : ""}{fP(v.rA)}</div>
+                      <div>ρ {v.rho >= 0 ? "+" : ""}{v.rho}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            <Inp l="거시경제 시나리오" ch={<select style={selS} value={inp.macroScenario} onChange={e => u("macroScenario", e.target.value)}>
+              {Object.entries(MACROS).map(([k, v]) => <option key={k} value={k}>{v.l}</option>)}
+            </select>} />
+            <Inp l={`기대 인플레이션 ${fP(inp.inflation)}`} ch={<input type="range" min={0} max={0.05} step={0.001} value={inp.inflation} onChange={e => u("inflation", +e.target.value)} style={{ width: "100%", accentColor: C.blue }} />} />
+            <div style={{ display: "flex", gap: 12, marginTop: 4 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 5, cursor: "pointer", fontSize: 11, color: C.textM }}>
+                <input type="checkbox" checked={inp.useRegime} onChange={e => u("useRegime", e.target.checked)} style={{ accentColor: C.blue }} />
+                Regime Switching 적용
+              </label>
+            </div>
+          </>} />
+
+          {/* 타소득 */}
+          <Sec t="□ 연금수령 시점 타 소득금액" ch={<Row2>
+            <Inp l="국민연금" ch={<select style={selS} value={inp.npOption} onChange={e => u("npOption", e.target.value)}>
+              {NP_OPTS.map(o => <option key={o.l}>{o.l}</option>)}
+            </select>} />
+            <Inp l="근로소득" ch={<select style={selS} value={inp.liOption} onChange={e => u("liOption", e.target.value)}>
+              {LI_OPTS.map(o => <option key={o.l}>{o.l}</option>)}
+            </select>} />
+          </Row2>} />
+
+          {/* 온라인/수수료 */}
+          <Sec t="□ 기타 옵션" ch={<Row2>
+            <Inp l="온라인 가입 여부" ch={<select style={selS} value={inp.onlineIRP ? "O" : "X"} onChange={e => u("onlineIRP", e.target.value === "O")}>
+              <option value="O">O (온라인)</option><option value="X">X (오프라인)</option>
+            </select>} />
+            <Inp l="IRP 수수료율 (연)" sub={`현재: ${fP(inp.feeRate)} (예: 0.001 = 0.1%)`} ch={<input style={iS} type="number" step="0.0001" value={inp.feeRate} onChange={e => u("feeRate", +e.target.value)} />} />
+          </Row2>} />
+
+          {/* 검증 경고 */}
+          {warnings.map((w, i) => <Alert key={`w${i}`} type={w.t} msg={w.m} />)}
+        </div>
+
+          {/* 실행 (하단 고정) */}
+          <button onClick={run} disabled={running || warnings.some(w => w.t === "warn" && w.m.includes("55세"))} style={{
+            width: "100%", padding: "13px", borderRadius: 8, marginTop: 8, flexShrink: 0,
+            background: running ? C.grayL : C.brown, color: "#fff", border: "none",
+            fontSize: 14, fontWeight: 700, cursor: running ? "wait" : "pointer",
+            boxShadow: running ? "none" : `0 3px 12px ${C.brown}40`, transition: "all 0.3s",
+          }}>{running ? "⏳ 시뮬레이션 실행 중..." : `▶ 시뮬레이션 실행 (${N.toLocaleString()}회)`}</button>
+        </div>
+
+        {/* ══ RIGHT PANEL ══ */}
+        <div>
+          {res && (<>
+            {/* ── 절세 효과 하이라이트 배너 (최상단) ── */}
+            {res.totalCmaTx > 0 && (() => {
+              const saved = res.totalCmaTx - res.totalTax;
+              const savedPct = res.totalCmaTx > 0 ? (saved / res.totalCmaTx * 100).toFixed(1) : 0;
+              return (
+                <div style={{
+                  background: `linear-gradient(135deg, #FFF9F0, ${C.blueXXL})`,
+                  border: `2px solid ${C.brown}`,
+                  borderRadius: 12, padding: "18px 22px", marginBottom: 14,
+                  display: "flex", alignItems: "center", gap: 20, flexWrap: "wrap",
+                }}>
+                  <div style={{ flex: "0 0 auto" }}>
+                    <div style={{ fontSize: 11, color: C.textL, marginBottom: 2 }}>IRP 연금 vs CMA 일시금 절세 금액</div>
+                    <div style={{ fontSize: 32, fontWeight: 800, color: saved > 0 ? C.red : C.blue, lineHeight: 1 }}>
+                      {saved > 0 ? "▲ " : "▼ "}{fK(Math.abs(saved))}
+                    </div>
+                    <div style={{ fontSize: 11, color: C.textM, marginTop: 4 }}>
+                      CMA 대비 <strong style={{ color: saved > 0 ? C.red : C.blue }}>{savedPct}%</strong> {saved > 0 ? "절감" : "추가 부담"}
+                    </div>
+                  </div>
+                  <div style={{ flex: 1, minWidth: 200, display: "flex", gap: 12 }}>
+                    <div style={{ flex: 1, background: "#fff", borderRadius: 8, padding: "10px 14px", border: `1px solid ${C.brownXL}60` }}>
+                      <div style={{ fontSize: 10, color: C.textL }}>일시금 → CMA 운용 시 총 세금</div>
+                      <div style={{ fontSize: 18, fontWeight: 700, color: C.brownL }}>{fK(res.totalCmaTx)}</div>
+                      <div style={{ fontSize: 9, color: C.textL }}>퇴직소득세 + 금융소득세 누적</div>
+                    </div>
+                    <div style={{ flex: 1, background: "#fff", borderRadius: 8, padding: "10px 14px", border: `1px solid ${C.blue}50` }}>
+                      <div style={{ fontSize: 10, color: C.textL }}>IRP 연금 수령 시 총 세금</div>
+                      <div style={{ fontSize: 18, fontWeight: 700, color: C.blue }}>{fK(res.totalTax)}</div>
+                      <div style={{ fontSize: 9, color: C.textL }}>연금소득세 누적 (과세이연)</div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Summary */}
+            <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+              <StatCard l="은퇴 설계 성공 확률" v={`${res.sr}%`} s={`${inp.targetAge}세까지 자산 유지`} accent />
+              <StatCard l="자산 고갈 건수" v={`${res.dC.toLocaleString()}`} s={`/ ${N.toLocaleString()}회`} />
+              <StatCard l="중위 자산수명" v={res.md ? `${res.md}세` : "유지"} s="고갈 시나리오 중앙값" />
+              <StatCard l={`${inp.targetAge}세 중위 잔액`} v={fK(res.cd[res.cd.length - 1]?.p50)} s="50th 백분위" />
+            </div>
+
+            {/* Info bar */}
+            <div style={{ display: "flex", gap: 6, marginBottom: 12, alignItems: "center", flexWrap: "wrap", fontSize: 11, color: C.textM }}>
+              <Badge t={`${inp.name} 고객`} c={`${C.brown}15`} />
+              <Badge t={WD_TYPES[inp.wdType].l} />
+              {inp.wdType === "금액확정형" && <Badge t={`연 ${fK(inp.fixedAmount)}`} />}
+              {(inp.wdType === "기간확정형" || inp.wdType === "운용손익길게수령" || inp.wdType === "1만원수령") && <Badge t={`${inp.fixedPeriod}년`} />}
+              <Badge t={inp.riskProfile === "직접입력" ? `수익률 ${fP(inp.customReturn)}` : inp.riskProfile} />
+              <Badge t={`거시 ${MACROS[inp.macroScenario].l}`} />
+              <Badge t={`인플레 ${fP(inp.inflation)}`} />
+              <span style={{ color: C.textL }}>|</span>
+              <span style={{ fontSize: 10 }}>수익률 <span style={{ color: C.red }}>{fP(eR.real - 2 * eR.vol)}</span> ~ <span style={{ color: C.green }}>{fP(eR.real + 2 * eR.vol)}</span> (95%)</span>
+            </div>
+
+            {/* 절세 최적화 알림 */}
+            {taxAlerts.map((a, i) => <Alert key={`ta${i}`} type={a.t} msg={a.m} action={a.action} onAction={a.handler} />)}
+
+            {/* Tabs */}
+            <div style={{ display: "flex", gap: 2, marginBottom: 12, borderBottom: `2px solid ${C.grayXL}` }}>
+              {tabs.map(t => (
+                <button key={t.id} onClick={() => setTab(t.id)} style={{
+                  padding: "8px 16px", border: "none", borderBottom: tab === t.id ? `3px solid ${C.blue}` : "3px solid transparent",
+                  background: "transparent", color: tab === t.id ? C.blue : C.textL,
+                  fontSize: 13, fontWeight: tab === t.id ? 700 : 500, cursor: "pointer", marginBottom: -2,
+                }}>{t.l}</button>
+              ))}
+            </div>
+
+            {/* CHARTS */}
+            {tab === "tax" && (() => {
+              const saved = res.totalCmaTx - res.totalTax;
+              const taxCompareData = res.cd.filter((_, i) => i > 0).map(r => ({
+                age: r.age,
+                cma: r.cumCmaTx,
+                irp: r.cumTx,
+                savings: Math.max(0, r.cumCmaTx - r.cumTx),
+              }));
+              return (<div style={cardS}>
+                <h4 style={{ fontSize: 14, color: C.brown, margin: "0 0 4px", fontWeight: 700 }}>
+                  {inp.name} 고객님 — IRP 연금 vs CMA 일시금 세금 비교
+                </h4>
+                <p style={{ fontSize: 10, color: C.textL, margin: "0 0 16px" }}>
+                  동일한 퇴직금을 IRP에서 연금으로 수령할 때와, 일시금 수령 후 개인 CMA에서 동일하게 운용할 때의 총 세금 차이를 비교합니다.
+                </p>
+
+                {/* 비교 요약 3칸 */}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 18 }}>
+                  <div style={{ background: "#FAFAFA", borderRadius: 8, padding: "12px 14px", textAlign: "center", border: `1px solid ${C.grayXL}` }}>
+                    <div style={{ fontSize: 10, color: C.textL, marginBottom: 4 }}>일시금 → CMA 총 세금</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: C.brown }}>{fK(res.totalCmaTx)}</div>
+                    <div style={{ fontSize: 9, color: C.textL, marginTop: 4 }}>퇴직소득세 {fK(lumpSumTax.total)}</div>
+                    <div style={{ fontSize: 9, color: C.textL }}>+ 금융소득세 {fK(res.totalCmaTx - lumpSumTax.total)}</div>
+                  </div>
+                  <div style={{ background: "#FAFAFA", borderRadius: 8, padding: "12px 14px", textAlign: "center", border: `1px solid ${C.grayXL}` }}>
+                    <div style={{ fontSize: 10, color: C.textL, marginBottom: 4 }}>IRP 연금 총 세금</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: C.blue }}>{fK(res.totalTax)}</div>
+                    <div style={{ fontSize: 9, color: C.textL, marginTop: 4 }}>세후 총수령 {fK(res.totalNet)}</div>
+                    <div style={{ fontSize: 9, color: C.textL }}>평균 세율 {res.totalWd > 0 ? fP(res.totalTax / res.totalWd) : "-"}</div>
+                  </div>
+                  <div style={{ background: saved > 0 ? "#FFF5F5" : "#F0F5FA", borderRadius: 8, padding: "12px 14px", textAlign: "center", border: `1px solid ${saved > 0 ? C.red : C.blue}25` }}>
+                    <div style={{ fontSize: 10, color: C.textL, marginBottom: 4 }}>IRP 연금의 절세 효과</div>
+                    <div style={{ fontSize: 22, fontWeight: 800, color: saved > 0 ? C.red : C.blue }}>
+                      {saved > 0 ? "▲ " : "▼ "}{fK(Math.abs(saved))}
+                    </div>
+                    <div style={{ fontSize: 9, color: C.textL, marginTop: 4 }}>
+                      {saved > 0 ? `CMA 대비 ${(saved / res.totalCmaTx * 100).toFixed(1)}% 절감` : "CMA가 유리"}
+                    </div>
+                  </div>
+                </div>
+
+                {/* 세금 누적 비교 차트 */}
+                <div style={{ borderTop: `1px solid ${C.grayXL}`, paddingTop: 14, marginBottom: 4 }}>
+                  <h4 style={{ fontSize: 12, color: C.brown, margin: "0 0 2px", fontWeight: 700 }}>연령별 누적 세금 비교</h4>
+                  <p style={{ fontSize: 9, color: C.textL, margin: "0 0 10px" }}>
+                    갈색 실선: CMA 누적 세금 (퇴직소득세 + 금융소득세) &nbsp;|&nbsp; 파란 실선: IRP 누적 세금 (연금소득세) &nbsp;|&nbsp; 녹색 영역: 절세 구간
+                  </p>
+                </div>
+                <ResponsiveContainer width="100%" height={280}>
+                  <ComposedChart data={taxCompareData} margin={{ top: 5, right: 16, left: 8, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={C.grayXL} />
+                    <XAxis dataKey="age" tick={{ fontSize: 10, fill: C.textL }} tickLine={false} />
+                    <YAxis tick={{ fontSize: 9, fill: C.textL }} tickLine={false} tickFormatter={fK} width={70} />
+                    <Tooltip content={<CTip />} />
+                    <Area type="monotone" dataKey="savings" fill={`${C.green}20`} stroke="none" name="절세 구간" />
+                    <Line type="monotone" dataKey="cma" stroke={C.brown} strokeWidth={2.5} dot={false} name="CMA 누적세금" />
+                    <Line type="monotone" dataKey="irp" stroke={C.blue} strokeWidth={2.5} dot={false} name="IRP 누적세금" />
+                    <Legend wrapperStyle={{ fontSize: 10 }} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+
+                {/* 비교 구조 설명 */}
+                <div style={{ marginTop: 16, borderTop: `1px solid ${C.grayXL}`, paddingTop: 14 }}>
+                  <h4 style={{ fontSize: 12, fontWeight: 700, color: C.brown, marginBottom: 10 }}>비교 전제 조건</h4>
+                  <div style={{ fontSize: 10, color: C.textM, lineHeight: 2.0 }}>
+                    <div><span style={{ fontWeight: 700, color: C.brown }}>동일 조건:</span> 동일한 퇴직금, 동일한 투자수익률, 동일한 인출 금액·시점을 적용하여 순수 세금 차이만 비교합니다.</div>
+                    <div style={{ marginTop: 6 }}><span style={{ fontWeight: 700, color: C.brown }}>CMA (일시금):</span> 퇴직소득세 100% 즉시 납부 → 세후 금액을 개인 CMA에서 동일하게 운용 → 운용수익에 대해 매년 금융소득세 15.4% 원천징수 (연 2,000만원 초과 시 종합과세 38.5% 적용)</div>
+                    <div style={{ marginTop: 6 }}><span style={{ fontWeight: 700, color: C.brown }}>IRP (연금):</span> 퇴직소득세 30~50% 감면 → IRP 내 과세이연 운용 → 인출 시점에 연금소득세 3.3~5.5% 납부 (연 1,500만원 이하 분리과세 가능)</div>
+                    <div style={{ marginTop: 6 }}><span style={{ fontWeight: 700, color: C.brown }}>핵심 차이:</span> CMA는 매년 수익에 과세되어 복리 효과가 감소하지만, IRP는 인출 시점까지 과세가 이연되어 전액이 복리로 운용됩니다.</div>
+                  </div>
+                </div>
+              </div>);
+            })()}
+
+            {tab === "asset" && (<div style={cardS}>
+              <h4 style={{ fontSize: 13, color: C.brown, margin: "0 0 2px", fontWeight: 700 }}>자산 추이 — 95% 신뢰구간</h4>
+              <p style={{ fontSize: 9, color: C.textL, margin: "0 0 12px" }}>진한 영역: 25~75th | 연한 영역: 5~95th | 실선: 중앙값(50th)</p>
+              <ResponsiveContainer width="100%" height={380}>
+                <ComposedChart data={res.cd} margin={{ top: 5, right: 16, left: 8, bottom: 5 }}>
+                  <defs>
+                    <linearGradient id="g95" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={C.blue} stopOpacity={.10} /><stop offset="100%" stopColor={C.blue} stopOpacity={.02} /></linearGradient>
+                    <linearGradient id="g75" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={C.blue} stopOpacity={.22} /><stop offset="100%" stopColor={C.blue} stopOpacity={.05} /></linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke={C.grayXL} />
+                  <XAxis dataKey="age" tick={{ fontSize: 10, fill: C.textL }} tickLine={false} axisLine={{ stroke: C.grayXL }} />
+                  <YAxis tick={{ fontSize: 9, fill: C.textL }} tickLine={false} axisLine={{ stroke: C.grayXL }} tickFormatter={fK} width={65} />
+                  <Tooltip content={<CTip />} />
+                  <Area type="monotone" dataKey="r5_95" fill="url(#g95)" stroke="none" name="5~95%" />
+                  <Area type="monotone" dataKey="r25_75" fill="url(#g75)" stroke="none" name="25~75%" />
+                  <Line type="monotone" dataKey="p50" stroke={C.blue} strokeWidth={2.5} dot={false} name="중앙값(50th)" />
+                  <Line type="monotone" dataKey="mean" stroke={C.amber} strokeWidth={1.2} strokeDasharray="4 3" dot={false} name="평균" />
+                  <Line type="monotone" dataKey="p5" stroke={C.red} strokeWidth={1} strokeDasharray="3 3" dot={false} name="하위 5%" />
+                  <Line type="monotone" dataKey="p95" stroke={C.green} strokeWidth={1} strokeDasharray="3 3" dot={false} name="상위 95%" />
+                  <ReferenceLine y={0} stroke={`${C.red}60`} strokeWidth={2} strokeDasharray="4 4" />
+                  <Legend wrapperStyle={{ fontSize: 10 }} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>)}
+
+            {tab === "wd" && (<div style={cardS}>
+              <h4 style={{ fontSize: 13, color: C.brown, margin: "0 0 2px", fontWeight: 700 }}>연간 수령액 추이 (세전/세후/세금 평균)</h4>
+              <ResponsiveContainer width="100%" height={380}>
+                <ComposedChart data={res.cd.filter((_, i) => i > 0)} margin={{ top: 5, right: 16, left: 8, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={C.grayXL} />
+                  <XAxis dataKey="age" tick={{ fontSize: 10, fill: C.textL }} tickLine={false} />
+                  <YAxis tick={{ fontSize: 9, fill: C.textL }} tickLine={false} tickFormatter={fK} width={65} />
+                  <Tooltip content={<CTip />} />
+                  <Bar dataKey="wdM" fill={C.blueM} radius={[3, 3, 0, 0]} name="세전 수령액" />
+                  <Bar dataKey="ntM" fill={C.green} radius={[3, 3, 0, 0]} name="세후 수령액" />
+                  <Bar dataKey="txM" fill={C.red} radius={[3, 3, 0, 0]} name="세금" />
+                  <Legend wrapperStyle={{ fontSize: 10 }} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>)}
+
+            {tab === "dep" && (<div style={cardS}>
+              <h4 style={{ fontSize: 13, color: C.brown, margin: "0 0 2px", fontWeight: 700 }}>자산 고갈 연령 분포</h4>
+              {res.ddd.length > 0 ? (
+                <ResponsiveContainer width="100%" height={350}>
+                  <BarChart data={res.ddd} margin={{ top: 5, right: 16, left: 8, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={C.grayXL} />
+                    <XAxis dataKey="age" tick={{ fontSize: 10, fill: C.textL }} tickLine={false} />
+                    <YAxis tick={{ fontSize: 9, fill: C.textL }} tickLine={false} />
+                    <Tooltip contentStyle={{ background: "#fff", border: `1px solid ${C.grayXL}`, borderRadius: 8, fontSize: 11 }}
+                      formatter={(v, n, p) => [`${v}건 (${p.payload.pct}%)`, "고갈 시나리오"]} />
+                    <Bar dataKey="count" fill={C.blueM} radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : (
+                <div style={{ height: 350, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column" }}>
+                  <div style={{ fontSize: 48, marginBottom: 12 }}>🎉</div>
+                  <div style={{ color: C.green, fontSize: 16, fontWeight: 700 }}>모든 시나리오에서 자산이 유지됩니다!</div>
+                </div>
+              )}
+            </div>)}
+
+            {tab === "sorr" && sorr && (() => {
+              const worst = sorr.quintiles[0], best = sorr.quintiles[4];
+              const gap = (best.survivalRate - worst.survivalRate).toFixed(1);
+              return (
+                <div style={cardS}>
+                  <h4 style={{ fontSize: 14, color: C.brown, margin: "0 0 4px", fontWeight: 700 }}>수익률 순서 리스크 (Sequence of Returns Risk)</h4>
+                  <p style={{ fontSize: 10, color: C.textL, margin: "0 0 14px" }}>
+                    같은 평균 수익률이라도 <b>은퇴 직후 {sorr.earlyYears}년 내 손실 발생 여부</b>가 장기 성공률을 크게 갈라놓습니다.
+                    10,000개 경로를 초반 {sorr.earlyYears}년 누적수익률 기준으로 5분위 분류했습니다.
+                  </p>
+
+                  <div style={{ display: "flex", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
+                    <StatCard l={`초반 ${sorr.earlyYears}년 최하위 20% 성공률`} v={`${worst.survivalRate}%`} s={`평균 초반수익률 ${fP(worst.avgEarlyRet)}`} />
+                    <StatCard l={`초반 ${sorr.earlyYears}년 최상위 20% 성공률`} v={`${best.survivalRate}%`} s={`평균 초반수익률 ${fP(best.avgEarlyRet)}`} accent />
+                    <StatCard l="순서 리스크 크기" v={`${gap}%p`} s="초반 최상 − 최하위 성공률 차이" />
+                  </div>
+
+                  <div style={{ borderTop: `1px solid ${C.grayXL}`, paddingTop: 14, marginBottom: 4 }}>
+                    <h4 style={{ fontSize: 12, color: C.brown, margin: "0 0 2px", fontWeight: 700 }}>초반 {sorr.earlyYears}년 수익률 5분위별 성공 확률</h4>
+                    <p style={{ fontSize: 9, color: C.textL, margin: "0 0 10px" }}>막대 위 수치: 해당 분위의 초반 {sorr.earlyYears}년 평균 누적수익률</p>
+                  </div>
+                  <ResponsiveContainer width="100%" height={230}>
+                    <BarChart data={sorr.quintiles} margin={{ top: 22, right: 16, left: 8, bottom: 5 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={C.grayXL} vertical={false} />
+                      <XAxis dataKey="label" tick={{ fontSize: 9, fill: C.textM }} tickLine={false} />
+                      <YAxis domain={[0, 100]} tick={{ fontSize: 9, fill: C.textL }} tickLine={false} tickFormatter={v => `${v}%`} width={40} />
+                      <Tooltip contentStyle={{ fontSize: 11, borderRadius: 8 }}
+                        formatter={(v, _, p) => [`${v}%`, `성공률 | 초반수익률 ${fP(p.payload.avgEarlyRet)}`]} />
+                      <Bar dataKey="survivalRate" radius={[4, 4, 0, 0]}
+                        label={{ position: "top", fontSize: 10, fill: C.textM, formatter: v => `${v}%` }}>
+                        {sorr.quintiles.map((q, i) => <Cell key={i} fill={q.color} />)}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+
+                  <div style={{ borderTop: `1px solid ${C.grayXL}`, paddingTop: 14, marginTop: 14, marginBottom: 4 }}>
+                    <h4 style={{ fontSize: 12, color: C.brown, margin: "0 0 2px", fontWeight: 700 }}>분위별 중위 자산 경로 비교</h4>
+                    <p style={{ fontSize: 9, color: C.textL, margin: "0 0 10px" }}>각 분위의 중앙값 경로. 같은 기간·같은 투자성향 — 초반 수익률 순서만 다릅니다.</p>
+                  </div>
+                  <ResponsiveContainer width="100%" height={280}>
+                    <ComposedChart data={sorr.pathData} margin={{ top: 5, right: 16, left: 8, bottom: 5 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={C.grayXL} />
+                      <XAxis dataKey="age" tick={{ fontSize: 10, fill: C.textL }} tickLine={false} />
+                      <YAxis tick={{ fontSize: 9, fill: C.textL }} tickLine={false} tickFormatter={fK} width={65} />
+                      <Tooltip content={<CTip />} />
+                      {sorr.quintiles.map((q, i) => (
+                        <Line key={i} type="monotone" dataKey={`q${i + 1}`} stroke={q.color}
+                          strokeWidth={i === 0 || i === 4 ? 2.5 : 1.2}
+                          strokeDasharray={i === 1 || i === 3 ? "4 3" : undefined}
+                          dot={false} name={q.label} />
+                      ))}
+                      <ReferenceLine y={0} stroke={`${C.red}60`} strokeWidth={2} strokeDasharray="4 4" />
+                      <Legend wrapperStyle={{ fontSize: 10 }} />
+                    </ComposedChart>
+                  </ResponsiveContainer>
+
+                  <div style={{ marginTop: 14, background: "#FFF9F0", border: `1px solid ${C.brownXL}40`, borderRadius: 8, padding: "12px 14px", fontSize: 10, color: C.textM, lineHeight: 1.8 }}>
+                    <div style={{ fontWeight: 700, color: C.brown, marginBottom: 4 }}>💡 수익률 순서 리스크란?</div>
+                    <div>초반 폭락 시나리오(최하 20%)에서는 <b style={{ color: C.red }}>{worst.survivalRate}%</b>의 성공률, 초반 호황(최상 20%)에서는 <b style={{ color: C.green }}>{best.survivalRate}%</b>의 성공률을 보입니다.
+                      수령 초기 손실 발생 시 이후 반등이 더 적은 원금에서 일어나기 때문에 회복이 어렵습니다.</div>
+                    <div style={{ marginTop: 6 }}><b>대응 전략:</b> 은퇴 초기 1~3년치 생활비를 현금·단기채권으로 별도 보유하면 시장 폭락 시 자산을 강제 매도하는 상황을 피할 수 있습니다.</div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {tab === "tbl" && (<div style={{ ...cardS, overflowX: "auto" }}>
+              <h4 style={{ fontSize: 13, color: C.brown, margin: "0 0 4px", fontWeight: 700 }}>연령별 자산 잔액 · 수령액 · 재원별 내역</h4>
+              <p style={{ fontSize: 9, color: C.textL, margin: "0 0 10px" }}>10,000회 시뮬레이션 평균 기준. 재원: ①과세제외(비과세) ②퇴직금(퇴직소득세) ③+④운용수익등(연금소득세)</p>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 9 }}>
+                <thead>
+                  <tr>
+                    <th rowSpan={2} style={{ padding: "5px 4px", textAlign: "center", color: "#fff", background: C.brown, fontWeight: 600, whiteSpace: "nowrap", position: "sticky", left: 0, zIndex: 1 }}>연령</th>
+                    <th rowSpan={2} style={{ padding: "5px 4px", textAlign: "right", color: "#fff", background: C.brown, fontWeight: 600, whiteSpace: "nowrap" }}>예상 잔액<br/>(중앙값)</th>
+                    <th rowSpan={2} style={{ padding: "5px 4px", textAlign: "right", color: "#fff", background: C.brown, fontWeight: 600, whiteSpace: "nowrap" }}>세전<br/>수령액</th>
+                    <th colSpan={3} style={{ padding: "4px", textAlign: "center", color: "#fff", background: C.brown, fontWeight: 600, borderBottom: `1px solid ${C.brownXL}` }}>재원별 인출 내역</th>
+                    <th rowSpan={2} style={{ padding: "5px 4px", textAlign: "right", color: "#fff", background: C.brown, fontWeight: 600, whiteSpace: "nowrap" }}>세금</th>
+                    <th rowSpan={2} style={{ padding: "5px 4px", textAlign: "right", color: "#fff", background: C.brown, fontWeight: 600, whiteSpace: "nowrap" }}>세율</th>
+                    <th rowSpan={2} style={{ padding: "5px 4px", textAlign: "right", color: "#fff", background: C.brown, fontWeight: 600, whiteSpace: "nowrap" }}>세후<br/>수령액</th>
+                  </tr>
+                  <tr>
+                    <th style={{ padding: "4px", textAlign: "right", color: "#fff", background: C.brownL, fontWeight: 500, fontSize: 8, whiteSpace: "nowrap" }}>①과세제외</th>
+                    <th style={{ padding: "4px", textAlign: "right", color: "#fff", background: C.brownL, fontWeight: 500, fontSize: 8, whiteSpace: "nowrap" }}>②퇴직금</th>
+                    <th style={{ padding: "4px", textAlign: "right", color: "#fff", background: C.brownL, fontWeight: 500, fontSize: 8, whiteSpace: "nowrap" }}>③+④운용수익등</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {res.cd.filter((_, i) => i > 0).map((r, idx) => (
+                    <tr key={r.age} style={{ borderBottom: `1px solid ${C.grayXL}`, background: idx % 2 === 0 ? "#FAFAF8" : "#fff" }}>
+                      <td style={{ padding: "4px 5px", textAlign: "center", color: C.brown, fontWeight: 600, position: "sticky", left: 0, background: idx % 2 === 0 ? "#FAFAF8" : "#fff", zIndex: 1 }}>{r.age}세</td>
+                      <td style={{ padding: "4px 5px", textAlign: "right", color: C.blue, fontWeight: 600 }}>{fK(r.p50)}</td>
+                      <td style={{ padding: "4px 5px", textAlign: "right", color: C.text, fontWeight: 600 }}>{fK(r.wdM)}</td>
+                      <td style={{ padding: "4px 5px", textAlign: "right", color: r.tfM > 0 ? C.green : C.grayL, fontSize: 8 }}>{r.tfM > 0 ? fK(r.tfM) : "-"}</td>
+                      <td style={{ padding: "4px 5px", textAlign: "right", color: r.rM > 0 ? C.brownL : C.grayL, fontSize: 8 }}>{r.rM > 0 ? fK(r.rM) : "-"}</td>
+                      <td style={{ padding: "4px 5px", textAlign: "right", color: r.sgM > 0 ? C.blue : C.grayL, fontSize: 8 }}>{r.sgM > 0 ? fK(r.sgM) : "-"}</td>
+                      <td style={{ padding: "4px 5px", textAlign: "right", color: C.red }}>{fK(r.txM)}</td>
+                      <td style={{ padding: "4px 5px", textAlign: "right", color: C.textM }}>{r.txRate > 0 ? fP(r.txRate) : "-"}</td>
+                      <td style={{ padding: "4px 5px", textAlign: "right", color: C.green, fontWeight: 600 }}>{fK(r.ntM)}</td>
+                    </tr>
+                  ))}
+                  {/* 합계 행 */}
+                  <tr style={{ borderTop: `2px solid ${C.brown}`, background: C.blueXXL }}>
+                    <td style={{ padding: "5px", textAlign: "center", fontWeight: 700, color: C.brown, position: "sticky", left: 0, background: C.blueXXL, zIndex: 1 }}>합계</td>
+                    <td style={{ padding: "5px", textAlign: "right", color: C.textL, fontSize: 8 }}>-</td>
+                    <td style={{ padding: "5px", textAlign: "right", fontWeight: 700, color: C.text }}>{fK(res.totalWd)}</td>
+                    <td colSpan={3} style={{ padding: "5px", textAlign: "right", color: C.textL, fontSize: 8 }}>-</td>
+                    <td style={{ padding: "5px", textAlign: "right", fontWeight: 700, color: C.red }}>{fK(res.totalTax)}</td>
+                    <td style={{ padding: "5px", textAlign: "right", fontWeight: 700, color: C.textM }}>{res.totalWd > 0 ? fP(res.totalTax / res.totalWd) : "-"}</td>
+                    <td style={{ padding: "5px", textAlign: "right", fontWeight: 700, color: C.green }}>{fK(res.totalNet)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>)}
+
+
+            {/* 옵션 가이드 */}
+            <div style={{ ...cardS, marginTop: 4 }}>
+              <h4 style={{ fontSize: 12, color: C.brown, margin: "0 0 8px", fontWeight: 700 }}>연금수령 옵션 가이드</h4>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
+                <thead><tr>{["수령방식", "설명", "비고"].map(h => (<th key={h} style={{ padding: "5px 8px", textAlign: "left", color: C.textL, borderBottom: `1px solid ${C.grayXL}`, fontWeight: 600 }}>{h}</th>))}</tr></thead>
+                <tbody>{Object.entries(WD_TYPES).map(([k, v]) => (
+                  <tr key={k} style={{ borderBottom: `1px solid ${C.grayXL}`, background: k === inp.wdType ? C.blueXXL : "transparent" }}>
+                    <td style={{ padding: "5px 8px", color: k === inp.wdType ? C.blue : C.text, fontWeight: k === inp.wdType ? 700 : 400, whiteSpace: "nowrap" }}>{k === inp.wdType ? "▸ " : ""}{v.l}</td>
+                    <td style={{ padding: "5px 8px", color: C.textM }}>{v.d}</td>
+                    <td style={{ padding: "5px 8px", color: C.amber, fontSize: 9 }}>{v.n}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </div>
+
+            {/* 세율 체계 */}
+            <div style={{ ...cardS, marginTop: 4 }}>
+              <h4 style={{ fontSize: 12, color: C.brown, margin: "0 0 6px", fontWeight: 700 }}>적용 세율 체계</h4>
+              <div style={{ fontSize: 10, color: C.textM, lineHeight: 1.8 }}>
+                <div><span style={{ color: C.brown, fontWeight: 600 }}>① 과세제외 자기부담금:</span> 비과세</div>
+                <div><span style={{ color: C.brown, fontWeight: 600 }}>② 이연퇴직소득:</span> 퇴직소득세율 × 70%(10년↓) / 60%(10~20년) / 50%(20년↑, 2026 신설) + 지방세 10%</div>
+                <div><span style={{ color: C.brown, fontWeight: 600 }}>③ 운용수익·세액공제분:</span> 55세↑ 5.5% | 70세↑ 4.4% | 80세↑ 3.3% (연 1,500만원 초과 시 16.5%)</div>
+                <div style={{ color: C.textL, marginTop: 4 }}>인출순서: ① 과세제외 → ② 이연퇴직소득 → ③ 운용수익·자기부담금</div>
+              </div>
+            </div>
+
+            {/* Footer */}
+            <div style={{ marginTop: 8, padding: "10px 14px", borderRadius: 6, background: C.grayXXL, fontSize: 9, color: C.textL, lineHeight: 1.7, borderTop: `2px solid ${C.brown}` }}>
+              ※ 본 자료는 연금수령 예상액을 가늠하기 위한 시뮬레이션으로, 실제 연금수령액과는 상이할 수 있습니다.
+              상기 예시된 금액이 미래의 수익을 보장하는 것은 아닙니다. &nbsp;|&nbsp;
+              CMA 기반 자산배분 · Markov-Regime Switching · Student-t(ν=5) GBM · {N.toLocaleString()}회 시뮬레이션
+              &nbsp;|&nbsp; <strong style={{ color: C.brown }}>한국투자증권 연금혁신본부</strong>
+            </div>
+          </>)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script></body></html>
